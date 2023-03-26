@@ -6,6 +6,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/ktime.h>
+
+#include "bn.h"
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -17,16 +20,20 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH 817
+
+#define NUM_TYPE uint32_t
+#define TMP_TYPE uint64_t
+#define MAX_VAL (0xFFFFFFFF)
+#define NUM_SZ (sizeof(NUM_TYPE))
 
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 
-static long long fib_sequence(long long k)
+static long long fib_sequence_dp(long long k)
 {
-    /* FIXME: C99 variable-length array (VLA) is not allowed in Linux kernel. */
     long long f[k + 2];
 
     f[0] = 0;
@@ -38,6 +45,87 @@ static long long fib_sequence(long long k)
 
     return f[k];
 }
+
+static long long fib_sequence(int k)
+{
+    if (k < 2)
+    return k;
+
+    long long first_element = 0;
+    long long second_element = 1;
+    long long cover_bits;
+    for(int i = 31 - __builtin_clz(k); i>=0; --i){
+        long long temp_1 = first_element * (2 * second_element - first_element);
+        long long temp_2 = first_element * first_element + second_element * second_element;
+        long long process_bits = 1UL<<i;
+        cover_bits = -!!(k&(process_bits));
+        first_element = (temp_1 & ~cover_bits) + (temp_2 & cover_bits);
+        second_element = (temp_1 & cover_bits) + temp_2;
+    }
+    return first_element;
+}
+
+void fib_og_bn(bn *target, unsigned int n){
+    bn_resize(target, 1);
+    if (n < 2){
+        target->digits[0] = n;
+        return;
+    }
+
+    bn *fst_ele = bn_alloc(1);
+    bn *sec_ele = bn_alloc(1);
+    target->digits[0] = 1;
+
+    for (unsigned int i = 1; i < n; i++){
+        bn_swap(sec_ele, target);
+        bn_add(fst_ele, sec_ele, target);
+        bn_swap(fst_ele, sec_ele);
+    }
+    bn_free(fst_ele);
+    bn_free(sec_ele);
+}
+
+
+void fib_fdbbn(bn *target, unsigned int n){
+    bn_resize(target, 1);
+    if (n < 2){
+        target->digits[0] = n;
+        return;
+    }
+    bn *f_k = target;
+    bn *f_k_next = bn_alloc(1);
+    f_k->digits[0] = 0;
+    f_k_next->digits[0] = 1;
+    bn *k = bn_alloc(1);
+    bn *k_next = bn_alloc(1);
+
+    for (unsigned int i = 1U << 31; i; i >>= 1){
+        bn_copy(k, k_next);
+        bn_lshift(k, 1, k);
+        bn_sub(k, f_k, k);
+        bn_mult(k, f_k, k);
+        bn_mult(f_k, f_k, f_k);
+        bn_mult(f_k_next, f_k_next, f_k_next);
+        /* f(k)*f(k) + f(k+1)*f(k+1) */
+        bn_copy(k_next,f_k);
+        bn_add(k_next, f_k_next, k_next);
+
+        if(n & i){
+            bn_copy(f_k, k_next);
+            bn_copy(f_k_next, k);
+            bn_add(f_k_next, k_next, f_k_next);
+        }
+        else{
+            bn_copy(f_k, k);
+            bn_copy(f_k_next, k_next);
+        }
+    }
+    bn_free(f_k_next);
+    bn_free(k);
+    bn_free(k_next);
+}
+
+
 
 static int fib_open(struct inode *inode, struct file *file)
 {
@@ -54,13 +142,21 @@ static int fib_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-/* calculate the fibonacci number at given offset */
 static ssize_t fib_read(struct file *file,
                         char *buf,
                         size_t size,
                         loff_t *offset)
 {
-    return (ssize_t) fib_sequence(*offset);
+    bn *fib = bn_alloc(1);
+    ktime_t k1 = ktime_get();
+    fib_og_bn(fib, *offset);
+    ktime_t k2 = ktime_sub(ktime_get(), k1);
+    char *p = bn_to_string(*fib);
+    size_t len = strlen(p) + 1;
+    // copy_to_user(buf, fib->number, sizeof(unsigned int)*size);
+    copy_to_user(buf, p, len);
+    bn_free(fib);
+    return ktime_to_ns(k2);
 }
 
 /* write operation is skipped */
@@ -69,7 +165,16 @@ static ssize_t fib_write(struct file *file,
                          size_t size,
                          loff_t *offset)
 {
-    return 1;
+    bn *fib = bn_alloc(1);
+    ktime_t k1 = ktime_get();
+    fib_fdbbn(fib, *offset);
+    ktime_t k2 = ktime_sub(ktime_get(), k1);
+    char *p = bn_to_string(*fib);
+    size_t len = strlen(p) + 1;
+    copy_to_user(buf, p, len);
+    bn_free(fib);
+    kfree(p);
+    return ktime_to_ns(k2);
 }
 
 static loff_t fib_device_lseek(struct file *file, loff_t offset, int orig)
